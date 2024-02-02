@@ -62,6 +62,7 @@
 #include <openssl/engine.h>
 #endif
 #include <openssl/x509v3.h>
+#include <openssl/ocsp.h>
 
 
 static int	verify_cb(int ok, X509_STORE_CTX *ctx);
@@ -100,6 +101,9 @@ static long win32_ssl_create_mutex = 0;
 
 static PQsslKeyPassHook_OpenSSL_type PQsslKeyPassHook = NULL;
 static int	ssl_protocol_version_to_openssl(const char *protocol);
+static int ocsp_response_check_cb(SSL *ssl);
+#define OCSP_CERT_STATUS_OK 	1
+#define OCSP_CERT_STATUS_NOK 	(-1)
 
 /* ------------------------------------------------------------ */
 /*			 Procedures common to all secure sessions			*/
@@ -1202,6 +1206,36 @@ initialize_SSL(PGconn *conn)
 		have_cert = true;
 	}
 
+	/* Enable OCSP stapling for certificate status check */
+	if (conn->ssl_ocsp_stapling &&
+		strlen(conn->ssl_ocsp_stapling) != 0 &&
+		(strcmp(conn->ssl_ocsp_stapling, "1") == 0))
+	{
+		/* set up certificate status request */
+		if (SSL_CTX_set_tlsext_status_type(SSL_context,
+				TLSEXT_STATUSTYPE_ocsp) != 1)
+		{
+			char	*err = SSLerrmessage(ERR_get_error());
+			libpq_append_conn_error(conn,
+					"could not set up certificate status request: %s", err);
+			SSLerrfree(err);
+			SSL_CTX_free(SSL_context);
+			return -1;
+		}
+
+		/* set up OCSP response callback */
+		if (SSL_CTX_set_tlsext_status_cb(SSL_context,
+				ocsp_response_check_cb) <= 0)
+		{
+			char	*err = SSLerrmessage(ERR_get_error());
+			libpq_append_conn_error(conn,
+					"could not set up OCSP response callback: %s", err);
+			SSLerrfree(err);
+			SSL_CTX_free(SSL_context);
+			return -1;
+		}
+	}
+
 	/*
 	 * The SSL context is now loaded with the correct root and client
 	 * certificates. Create a connection-specific SSL object. The private key
@@ -2062,4 +2096,107 @@ ssl_protocol_version_to_openssl(const char *protocol)
 #endif
 
 	return -1;
+}
+
+
+/*
+ * Verify OCSP stapling response in the context of an SSL/TLS connection.
+ *
+ * This function checks whether the server provided an OCSP response
+ * as part of the TLS handshake, verifies its integrity, and checks the
+ * revocation status of the presented certificates.
+ *
+ * Parameters:
+ *   - ssl: SSL/TLS connection object.
+ *
+ * Returns:
+ *   - OCSP_CERT_STATUS_OK: OCSP stapling was not requested or status is OK.
+ *   - OCSP_CERT_STATUS_NOK: OCSP verification failed or status is not OK.
+ *
+ * Steps:
+ *   1. Retrieve OCSP response during handshake.
+ *   2. Perform basic OCSP response verification.
+ *   3. Verify each revocation status in the OCSP response.
+ *
+ * Cleanup:
+ *   - Free allocated memory for the OCSP response and basic response.
+ */
+static int ocsp_response_check_cb(SSL *ssl)
+{
+	const unsigned char *resp;
+	long resp_len = 0;
+	int cert_index = 0;
+	int num_of_resp = 0;
+	OCSP_RESPONSE *ocsp_resp = NULL;
+	OCSP_BASICRESP *basic_resp = NULL;
+	OCSP_SINGLERESP *single_resp = NULL;
+	int status = OCSP_CERT_STATUS_NOK;
+
+	/*
+	 * step-1: retrieve OCSP response
+	 * refer to 'ocsp_resp_cb' in openssl/apps/s_client.c
+	 */
+	/* check if requested certificate status */
+	if (SSL_get_tlsext_status_type(ssl) != TLSEXT_STATUSTYPE_ocsp)
+		return OCSP_CERT_STATUS_OK;
+
+	/* check if got OCSP response */
+	resp_len = SSL_get_tlsext_status_ocsp_resp(ssl, &resp);
+	if (resp == NULL)
+		goto cleanup; /* no OCSP response */
+
+	/* convert OCSP response to internal format */
+	ocsp_resp = d2i_OCSP_RESPONSE(NULL, &resp, resp_len);
+	if (ocsp_resp == NULL)
+		goto cleanup; /* failed to convert OCSP response */
+
+	/*
+	 * step-2: verify the basic of OCSP response
+	 * refer to 'ocsp_main' in openssl/apps/ocsp.c
+	 */
+	if (OCSP_response_status(ocsp_resp) != OCSP_RESPONSE_STATUS_SUCCESSFUL)
+		goto cleanup; /* OCSP response not successful */
+
+	/* get OCSP basic response structure */
+	basic_resp = OCSP_response_get1_basic(ocsp_resp);
+	if (basic_resp == NULL)
+		goto cleanup; /* failed to get basic OCSP response */
+
+	/* perform basic OCSP response verify */
+	if (OCSP_basic_verify(basic_resp, SSL_get_peer_cert_chain(ssl),
+			SSL_CTX_get_cert_store(SSL_get_SSL_CTX(ssl)), 0) != 1)
+		goto cleanup; /* basic verification failed */
+
+	/*
+	 * step-3: verify each revocation status
+	 * ref to 'ct_extract_ocsp_response_scts' in openssl/ssl/ssl_lib.c
+	 */
+	num_of_resp = OCSP_resp_count(basic_resp);
+	for (cert_index = 0; cert_index < num_of_resp; cert_index ++)
+	{
+		single_resp = OCSP_resp_get0(basic_resp, cert_index);
+		if (single_resp == NULL)
+			goto cleanup; /* failed to get single response */
+
+		if (OCSP_single_get0_status(single_resp, NULL, NULL, NULL, NULL)
+				== V_OCSP_CERTSTATUS_GOOD)
+			continue; /* status is good */
+		else
+		{
+			/* status is revoked or unknown */
+			status = OCSP_CERT_STATUS_NOK;
+			break;
+		}
+	}
+	if (cert_index == num_of_resp)
+		status = OCSP_CERT_STATUS_OK;
+
+cleanup:
+	if (ocsp_resp != NULL)
+		OCSP_RESPONSE_free(ocsp_resp);
+
+	if (basic_resp != NULL)
+		OCSP_BASICRESP_free(basic_resp);
+
+	return status;
 }
